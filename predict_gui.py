@@ -7,23 +7,31 @@ from tkinter import filedialog, messagebox, ttk
 
 # ── Monkey‐patch lief so Ember 0.1.0 doesn’t blow up ──
 import lief
-if not hasattr(lief, "bad_format"):
-    if hasattr(lief, "BadFormat"):
-        lief.bad_format = lief.BadFormat
-    else:
-        class bad_format(Exception):
-            pass
-        lief.bad_format = bad_format
+# Newer LIEF releases removed the exception names EMBER (2018) catches.
+# Recreate any that are missing so feature extraction works on any LIEF version.
+for _name in ("bad_format", "bad_file", "pe_error", "parser_error",
+              "read_out_of_bound", "not_found"):
+    if not hasattr(lief, _name):
+        setattr(lief, _name, type(_name, (Exception,), {}))
 
 import ember  # now safe to import
 
-# --- Configuration for Ember 0.1.0 ---
+# --- Configuration ---
 MODEL_PATH = "malware_model.pkl"
-EMBER_FEATURE_VERSION = 1  # must be 1 for Ember 0.1.0
+THRESHOLD = 0.5  # P(malicious) at or above this is reported as malicious
+
+# EMBER feature version 1 produces 2351 features, version 2 produces 2381.
+# Pick the version that matches what the model was trained on.
+FEATURES_TO_VERSION = {2351: 1, 2381: 2}
+
+def feature_version_for(m):
+    n = m.num_feature() if hasattr(m, "num_feature") else getattr(m, "n_features_in_", None)
+    return FEATURES_TO_VERSION.get(n, 2)
 
 # --- Initialization ---
 try:
     model     = joblib.load(MODEL_PATH)
+    EMBER_FEATURE_VERSION = feature_version_for(model)
     extractor = ember.PEFeatureExtractor(EMBER_FEATURE_VERSION)
     print(f"[INIT] Loaded model and Ember feature-version {EMBER_FEATURE_VERSION}")
 except Exception as e:
@@ -51,11 +59,14 @@ def predict_file(path):
     if feats is None:
         return "Extraction failed."
     try:
-        X    = np.array(feats, dtype=float).reshape(1, -1)
-        pred = model.predict(X)[0]
-        prob = model.predict_proba(X)[0][pred]
-        label = "Malicious" if pred == 1 else "Benign"
-        return f"{label} (Confidence: {prob:.2%})"
+        X = np.array(feats, dtype=float).reshape(1, -1)
+        if hasattr(model, "predict_proba"):      # scikit-learn model
+            p_malicious = float(model.predict_proba(X)[0][1])
+        else:                                     # LightGBM Booster returns P(malicious)
+            p_malicious = float(model.predict(X)[0])
+        if p_malicious >= THRESHOLD:
+            return f"Malicious (Confidence: {p_malicious:.2%})"
+        return f"Benign (Confidence: {1 - p_malicious:.2%})"
     except Exception as e:
         print(f"[ERROR] Predicting {path}: {e}")
         messagebox.showerror("Prediction Error", str(e))
